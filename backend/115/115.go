@@ -804,12 +804,7 @@ func (f *Fs) getURL(ctx context.Context, remote string, pickCode string) (string
 	opts.MultipartParams.Set("data", crypto.Encode([]byte(data), key))
 	var err error
 	var info api.GetURLResponse
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
-	})
-
+	_, err = f.srv.CallJSON(ctx, &opts, nil, &info)
 	if err != nil {
 		return "", err
 	}
@@ -1034,20 +1029,20 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	fs.Logf(o.fs, "open %v, options: %v", o.remote, options)
-	targetURL, err := o.fs.getURL(ctx, o.remote, o.pickCode)
-	if err != nil {
-		return nil, err
-	}
-	fs.FixRangeOption(options, o.size)
-	opts := rest.Opts{
-		Method:  http.MethodGet,
-		RootURL: targetURL,
-		Options: options,
-	}
-
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
+		fs.Logf(o.fs, "open %v, options: %v", o.remote, options)
+		targetURL, err := o.fs.getURL(ctx, o.remote, o.pickCode)
+		if err != nil {
+			return shouldRetry(ctx, resp, err)
+		}
+		fs.FixRangeOption(options, o.size)
+		opts := rest.Opts{
+			Method:  http.MethodGet,
+			RootURL: targetURL,
+			Options: options,
+		}
+
 		resp, err = o.fs.srv.Call(ctx, &opts)
 		return shouldRetry(ctx, resp, err)
 	})
