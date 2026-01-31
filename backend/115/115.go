@@ -1,21 +1,22 @@
 package _115
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/aliyun/aliyun-oss-go-sdk/oss"
+	"github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/patrickmn/go-cache"
 	"github.com/rclone/rclone/backend/115/api"
 	"github.com/rclone/rclone/backend/115/crypto"
@@ -23,6 +24,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
@@ -88,6 +90,19 @@ func init() {
 				encoder.EncodePipe |
 				encoder.EncodePercent |
 				encoder.EncodeInvalidUtf8),
+		}, {
+			Name:     "page_size",
+			Default:  100,
+			Help:     "Number of files to list per page. If you have many files, you can increase this number to reduce the number of API calls.",
+			Advanced: true,
+		}, {
+			Name:     "mount_point",
+			Help:     "Local mount point to wait for before binding.",
+			Advanced: true,
+		}, {
+			Name:     "bind_path",
+			Help:     "Target path to bind mount the remote path to.",
+			Advanced: true,
 		}},
 	})
 }
@@ -99,7 +114,12 @@ type Options struct {
 	SEID           string               `config:"seid"`
 	KID            string               `config:"kid"`
 	PacerMinSleep  fs.Duration          `config:"pacer_min_sleep"`
+	CacheExpire    fs.Duration          `config:"cache_expire"`
 	MaxConnections int                  `config:"max_connections"`
+	PageSize       int64                `config:"page_size"`
+	MountPoint     string               `config:"mount_point"`
+	BindPath       string               `config:"bind_path"`
+	WafSleep       fs.Duration          `config:"waf_sleep"`
 	Enc            encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -113,6 +133,7 @@ type Fs struct {
 	srv      *rest.Client
 	pacer    *fs.Pacer
 	cache    *cache.Cache
+	client   *driver.Pan115Client
 }
 
 // Object describes a 115 object
@@ -130,8 +151,30 @@ type Object struct {
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
-	// TODO: impl
+func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if resp != nil && (resp.StatusCode == http.StatusTooManyRequests ||
+		resp.StatusCode == http.StatusForbidden ||
+		resp.StatusCode == 405 ||
+		resp.StatusCode >= 500) {
+		if resp.StatusCode == 405 && f.opt.WafSleep > 0 {
+			fs.Logf(f, "Risk control (405) detected, sleeping for %v before retrying", f.opt.WafSleep)
+			time.Sleep(time.Duration(f.opt.WafSleep))
+		}
+		// Always try to read body for more context if error is nil OR if we want to ensure detail
+		if err == nil {
+			body, readErr := rest.ReadBody(resp)
+			if readErr != nil {
+				err = fmt.Errorf("HTTP error %v (%v) - failed to read body: %w", resp.StatusCode, resp.Status, readErr)
+			} else {
+				err = fmt.Errorf("HTTP error %v (%v) returned body: %q", resp.StatusCode, resp.Status, body)
+			}
+		}
+
+		return true, err
+	}
+	if err != nil {
+		return fserrors.ShouldRetry(err), err
+	}
 	return false, err
 }
 
@@ -149,6 +192,12 @@ func NewFs(ctx context.Context, name string, root string, m configmap.Mapper) (f
 	if root == "" {
 		root = "/"
 	}
+
+	// Default internal cache expire to 24h if not set
+	if opt.CacheExpire == 0 {
+		opt.CacheExpire = fs.Duration(24 * time.Hour)
+	}
+
 	ci := fs.GetConfig(ctx)
 	f := &Fs{
 		name:  name,
@@ -157,7 +206,7 @@ func NewFs(ctx context.Context, name string, root string, m configmap.Mapper) (f
 		ci:    ci,
 		srv:   rest.NewClient(&http.Client{}),
 		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(opt.PacerMinSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-		cache: cache.New(time.Minute, time.Minute*2),
+		cache: cache.New(time.Duration(opt.CacheExpire), time.Duration(opt.CacheExpire)*2),
 	}
 	f.srv.SetErrorHandler(func(resp *http.Response) error {
 		body, err := rest.ReadBody(resp)
@@ -201,10 +250,61 @@ func NewFs(ctx context.Context, name string, root string, m configmap.Mapper) (f
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
 
+	// Initialize 115driver client
+	cr := &driver.Credential{}
+	// Create cookie string
+	cookieStr := fmt.Sprintf("UID=%s;CID=%s;SEID=%s;KID=%s", opt.UID, opt.CID, opt.SEID, opt.KID)
+	if err := cr.FromCookie(cookieStr); err != nil {
+		return nil, fmt.Errorf("failed to parse cookie: %w", err)
+	}
+	f.client = driver.New(driver.UA(driver.UA115Browser)).ImportCredential(cr)
+
+	// Explicitly GetUploadInfo to ensure Userkey is correct (cookie KID != Userkey)
+	// and UploadMetaInfo is populated.
+	if err := f.client.GetUploadInfo(); err != nil {
+		return nil, fmt.Errorf("failed to get upload info: %w", err)
+	}
+
+	if err := f.client.CookieCheck(); err != nil {
+		// Log warning but don't fail, maybe token expired or network issue?
+	}
+
 	info, err := f.readMetaDataForPath(ctx, f.remotePath("/"))
+
 	if err == nil && !info.IsDir() {
 		f.root = path.Dir(f.root)
 		return f, fs.ErrorIsFile
+	}
+
+	// Auto bind mount if configured
+	if opt.MountPoint != "" && opt.BindPath != "" {
+		go func() {
+			fs.Logf(f, "Waiting for mount point %s to be ready...", opt.MountPoint)
+			// Wait for up to 60 seconds
+			for i := 0; i < 60; i++ {
+				// Check if mountpoint exists and is a directory
+				if fi, err := os.Stat(opt.MountPoint); err == nil && fi.IsDir() {
+					// Check if it's actually accessible (rclone mounted) by listing it?
+					// Or just try to mount --bind. If it fails, we retry.
+					// We interpret MountPoint as the SOURCE path
+
+					fs.Logf(f, "Mount source %s found, attempting bind mount to %s", opt.MountPoint, opt.BindPath)
+
+					// Ensure target is clean before binding
+					_ = exec.Command("umount", "-l", opt.BindPath).Run()
+
+					cmd := exec.Command("mount", "--bind", opt.MountPoint, opt.BindPath)
+					if out, err := cmd.CombinedOutput(); err == nil {
+						fs.Logf(f, "Bind mount successful: %s -> %s", opt.MountPoint, opt.BindPath)
+						return
+					} else {
+						fs.Logf(f, "Bind mount failed (retrying): %v, output: %s", err, string(out))
+					}
+				}
+				time.Sleep(1 * time.Second)
+			}
+			fs.Errorf(f, "Bind mount timed out after 60s")
+		}()
 	}
 
 	return f, nil
@@ -232,7 +332,7 @@ func (f *Fs) Features() *fs.Features {
 
 // Precision of the ModTimes in this Fs
 func (f *Fs) Precision() time.Duration {
-	return fs.ModTimeNotSupported
+	return time.Second
 }
 
 // Hashes returns the supported hash types of the filesystem
@@ -288,8 +388,11 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	f.createObject(src.Remote(), src.ModTime(ctx), src.Size())
 	if src.Size() == 0 {
-		return nil, fs.ErrorCantUploadEmptyFiles
+		fs.Debugf(src, "Skipping upload of empty file (not supported by 115)")
+		o := f.createObject(src.Remote(), src.ModTime(ctx), src.Size())
+		return o, nil
 	}
 	// TODO: enable file upload
 
@@ -585,7 +688,10 @@ func (f *Fs) readDir(ctx context.Context, remoteDir string) ([]*api.FileInfo, er
 		return nil, err
 	}
 
-	pageSize := int64(1000)
+	pageSize := f.opt.PageSize
+	if pageSize < 500 {
+		pageSize = 500
+	}
 	offset := int64(0)
 	files := make([]*api.FileInfo, 0)
 	for {
@@ -602,6 +708,15 @@ func (f *Fs) readDir(ctx context.Context, remoteDir string) ([]*api.FileInfo, er
 		if offset >= resp.Count {
 			break
 		}
+
+		// Pace pagination requests to avoid triggering 115 risk control
+		baseSleep := time.Duration(f.opt.PacerMinSleep)
+		if baseSleep == 0 {
+			baseSleep = 500 * time.Millisecond
+		}
+		// Add Jitter: 0 to 50% of baseSleep
+		jitter := time.Duration(rand.Int63n(int64(baseSleep)/2 + 1))
+		time.Sleep(baseSleep + jitter)
 	}
 	f.cache.SetDefault(cacheKey, files)
 
@@ -622,7 +737,7 @@ func (f *Fs) makeDir(ctx context.Context, pid int64, name string) error {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -651,7 +766,7 @@ func (f *Fs) getDirID(ctx context.Context, remoteDir string) (int64, error) {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return -1, err
@@ -688,7 +803,7 @@ func (f *Fs) getFiles(ctx context.Context, dir string, cid int64, pageSize int64
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
@@ -714,7 +829,7 @@ func (f *Fs) deleteFile(ctx context.Context, fid int64, pid int64) error {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -745,7 +860,7 @@ func (f *Fs) moveFile(ctx context.Context, fid int64, pid int64) error {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -772,7 +887,7 @@ func (f *Fs) renameFile(ctx context.Context, fid int64, name string) error {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -802,6 +917,9 @@ func (f *Fs) getURL(ctx context.Context, remote string, pickCode string) (string
 		Path:            "/app/chrome/downurl",
 		Parameters:      url.Values{},
 		MultipartParams: url.Values{},
+		ExtraHeaders: map[string]string{
+			"User-Agent": "go-resty/2.14.0 (https://github.com/go-resty/resty)",
+		},
 	}
 	opts.Parameters.Add("t", strconv.FormatInt(time.Now().Unix(), 10))
 	opts.MultipartParams.Set("data", crypto.Encode([]byte(data), key))
@@ -838,133 +956,6 @@ func (f *Fs) getURL(ctx context.Context, remote string, pickCode string) (string
 	return "", fs.ErrorObjectNotFound
 }
 
-func (f *Fs) createUploadTicket(ctx context.Context, cid int64, name string, dr *crypto.DigestResult) (*api.UploadInitResponse, error) {
-	fs.Logf(f, "create upload ticket, cid: %v, name: %v", cid, name)
-
-	if dr.Size > uploadSizeLimit {
-		return nil, fmt.Errorf("upload reach the limit")
-	}
-
-	uploadInfo, err := f.getUploadInfo(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// Based on SheltonZhu/115driver, use hardcoded version instead of API response
-	// The API may return 0 or invalid values, so we use known working values
-	appID := "0"
-	appVersion := "27.0.5.7"
-
-	// Debug: Log the upload info
-	fs.Logf(f, "upload info: appid=%v (hardcoded), appversion=%v (hardcoded), userid=%v, isptype=%v",
-		appID, appVersion, uploadInfo.UserID, uploadInfo.IspType)
-
-	opts := rest.Opts{
-		Method:          http.MethodPost,
-		RootURL:         "https://uplb.115.com",
-		Path:            "/3.0/initupload.php",
-		Parameters:      url.Values{},
-		MultipartParams: url.Values{},
-	}
-	targetID := fmt.Sprintf("U_1_%d", cid)
-	opts.Parameters.Set("appid", appID)
-	opts.Parameters.Set("appversion", appVersion)
-	opts.Parameters.Set("isp", strconv.FormatInt(uploadInfo.IspType, 10))
-	opts.Parameters.Set("sig", crypto.UploadSignature(uploadInfo.UserID, uploadInfo.UserKey, targetID, dr.QuickId))
-	opts.Parameters.Set("format", "json")
-	opts.Parameters.Set("t", strconv.FormatInt(time.Now().Unix(), 10))
-
-	opts.MultipartParams.Set("app_ver", appVersion)
-	opts.MultipartParams.Set("preID", dr.PreId)
-	opts.MultipartParams.Set("quickid", dr.QuickId)
-	opts.MultipartParams.Set("target", targetID)
-	opts.MultipartParams.Set("fileid", dr.QuickId)
-	opts.MultipartParams.Set("filename", f.opt.Enc.FromStandardName(name))
-	opts.MultipartParams.Set("filesize", strconv.FormatInt(dr.Size, 10))
-	opts.MultipartParams.Set("userid", strconv.FormatInt(uploadInfo.UserID, 10))
-
-	var info api.UploadInitResponse
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		fs.Logf(f, "upload init request failed, err: %v", err)
-		return nil, err
-	}
-
-	// Debug: Log the response with all details
-	fs.Logf(f, "upload init response: status=%v, pickcode=%v, bucket=%v, object=%v, errorCode=%v, errorMsg=%v",
-		info.Status, info.PickCode, info.Bucket, info.Object, info.ErrorCode, info.ErrorMsg)
-
-	// Check for error responses
-	if info.ErrorCode != 0 {
-		return nil, fmt.Errorf("upload init failed: errorCode=%v, errorMsg=%v (status=%v)",
-			info.ErrorCode, info.ErrorMsg, info.Status)
-	}
-
-	// Check if file already exists (status=2 means file exists, use pickcode)
-	if info.Status.String() == "2" && info.PickCode != "" {
-		fs.Logf(f, "file already exists on server, pickcode: %v", info.PickCode)
-		// File already exists, no need to upload
-		return &info, nil
-	}
-
-	// Check if we got valid OSS upload info
-	if info.Bucket == "" || info.Object == "" {
-		return nil, fmt.Errorf("invalid upload response: bucket=%v, object=%v, status=%v, errorMsg=%v",
-			info.Bucket, info.Object, info.Status, info.ErrorMsg)
-	}
-
-	return &info, nil
-}
-
-func (f *Fs) getUploadInfo(ctx context.Context) (*api.UploadInfoResponse, error) {
-	opts := rest.Opts{
-		Method:  http.MethodGet,
-		RootURL: "https://proapi.115.com",
-		Path:    "/app/uploadinfo",
-	}
-
-	var err error
-	var info api.UploadInfoResponse
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Note: We don't use AppID and AppVersion from this response
-	// Instead, we use hardcoded values in createUploadTicket
-	// This matches the behavior of SheltonZhu/115driver
-	return &info, nil
-}
-
-func (f *Fs) getUploadToken(ctx context.Context) (*api.UploadOssTokenResponse, error) {
-	opts := rest.Opts{
-		Method:  http.MethodGet,
-		RootURL: "https://uplb.115.com",
-		Path:    "/3.0/gettoken.php",
-	}
-
-	var err error
-	var info api.UploadOssTokenResponse
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return &info, nil
-}
-
 func (f *Fs) indexInfo(ctx context.Context) (*api.IndexInfoResponse, error) {
 	opts := rest.Opts{
 		Method: http.MethodGet,
@@ -976,27 +967,13 @@ func (f *Fs) indexInfo(ctx context.Context) (*api.IndexInfoResponse, error) {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	return &info, nil
-}
-
-func (f *Fs) getOssClient(ctx context.Context) (*oss.Client, error) {
-	uploadToken, err := f.getUploadToken(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	return oss.New(ossEndpoint,
-		uploadToken.AccessKeyID,
-		uploadToken.AccessKeySecret,
-		oss.SecurityToken(uploadToken.SecurityToken),
-		oss.EnableMD5(true),
-		oss.EnableCRC(false))
 }
 
 func (f *Fs) createObject(remote string, modTime time.Time, size int64) *Object {
@@ -1066,10 +1043,10 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
-		fs.Logf(o.fs, "open %v, options: %v", o.remote, options)
+		fs.Debugf(o.fs, "open %v, options: %v", o.remote, options)
 		targetURL, err := o.fs.getURL(ctx, o.remote, o.pickCode)
 		if err != nil {
-			return shouldRetry(ctx, resp, err)
+			return o.fs.shouldRetry(ctx, resp, err)
 		}
 		fs.FixRangeOption(options, o.size)
 
@@ -1078,20 +1055,29 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		client := &http.Client{}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 		if err != nil {
-			return shouldRetry(ctx, resp, err)
+			return o.fs.shouldRetry(ctx, resp, err)
 		}
 
-		// Set User-Agent to match the one used when getting the URL
-		req.Header.Set("User-Agent", userAgent)
+		// Use generic User-Agent to match 115driver/go-resty success behavior
+		// The server might be blocking "115Browser" UA if other browser headers are missing.
+		// Also inject the auth cookies manually.
+		cookieStr := fmt.Sprintf("UID=%s; CID=%s; SEID=%s; KID=%s", o.fs.opt.UID, o.fs.opt.CID, o.fs.opt.SEID, o.fs.opt.KID)
 
-		// Apply range options
+		req.Header.Set("User-Agent", "go-resty/2.14.0 (https://github.com/go-resty/resty)")
+		req.Header.Set("Cookie", cookieStr)
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded") // Copying from 115driver just in case
+
+		// Apply range options - only set header if key is not empty
 		for _, option := range options {
 			key, value := option.Header()
-			req.Header.Set(key, value)
+			if key != "" && value != "" {
+				req.Header.Set(key, value)
+			}
 		}
 
 		resp, err = client.Do(req)
-		return shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1145,9 +1131,13 @@ func (o *Object) ID() string {
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	f := o.fs
+	if src.Size() == 0 {
+		fs.Debugf(src, "Skipping upload of empty file (not supported by 115)")
+		return nil
+	}
 	// TODO: enable file upload
 
-	f := o.fs
 	obj, err := f.NewObject(ctx, src.Remote())
 	if err == nil {
 		fs.Logf(f, "file exist, remote it, %+v", obj)
@@ -1158,77 +1148,93 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 
-	parent, _ := path.Split(src.Remote())
-	err = f.Mkdir(ctx, parent)
-	if err != nil {
-		return err
+	// Use 115driver for upload
+	// 115driver requires a robust io.ReadSeeker for hash calculation (multiple passes)
+	// rclone might provide an asyncreader which fails Seek, so we must verify or spool.
+	var uploadSeeker io.ReadSeeker
+	var tempFile *os.File
+	var seekableReader io.ReadCloser
+
+	// Helper to cleanup temp file if used
+	defer func() {
+		if tempFile != nil {
+			_ = tempFile.Close()
+			_ = os.Remove(tempFile.Name())
+		}
+		// If we opened a new reader from source, close it
+		if seekableReader != nil {
+			_ = seekableReader.Close()
+		}
+	}()
+
+	isSeekable := false
+	if seeker, ok := in.(io.ReadSeeker); ok {
+		// Verify it actually supports seeking (AsyncReader panics/errors)
+		if _, err := seeker.Seek(0, io.SeekCurrent); err == nil {
+			// Also need to be able to rewind to start
+			if _, err := seeker.Seek(0, io.SeekStart); err == nil {
+				isSeekable = true
+				uploadSeeker = seeker
+			}
+		}
 	}
 
-	ossClient, err := f.getOssClient(ctx)
-	if err != nil {
-		fs.Logf(f, "get oss client fail, err: %v", err)
-		return err
+	// Optimization: If input is not seekable, check if source object supports reopening as seekable
+	if !isSeekable {
+		if srcObj, ok := src.(fs.Object); ok {
+			// Try to open the source object to see if we get a seekable reader (e.g. valid for local files)
+			// This avoids spooling the file to a temp file if we can just re-read it from source
+			rc, err := srcObj.Open(ctx)
+			if err == nil {
+				if seeker, ok := rc.(io.ReadSeeker); ok {
+					// Verify seek support
+					if _, err := seeker.Seek(0, io.SeekStart); err == nil {
+						fs.Debugf(src, "Optimization: Using seekable source reader instead of spooling")
+						isSeekable = true
+						uploadSeeker = seeker
+						seekableReader = rc // Keep reference to close later
+					} else {
+						_ = rc.Close()
+					}
+				} else {
+					_ = rc.Close()
+				}
+			}
+		}
+	}
+
+	if !isSeekable {
+		// Spool to temporary file
+		fs.Logf(f, "Input is not seekable, spooling to temporary file for 115 upload")
+		var err error
+		tempFile, err = os.CreateTemp("", "rclone-115-upload-*")
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
+
+		if _, err := io.Copy(tempFile, in); err != nil {
+			return fmt.Errorf("failed to spool to temp file: %w", err)
+		}
+
+		// Rewind temp file
+		if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to rewind temp file: %w", err)
+		}
+		uploadSeeker = tempFile
 	}
 
 	dir, name := path.Split(f.remotePath(src.Remote()))
+	// We need the directory ID (cid) for 115driver
+	// note: using dir as string ID might be tricky if it expects root ID etc.
+	// 115driver usually takes "cid" string.
 	cid, err := f.getDirID(ctx, dir)
 	if err != nil {
 		return err
 	}
+	cidStr := strconv.FormatInt(cid, 10)
 
-	var uploadReader io.Reader
-	var digest *crypto.DigestResult
-
-	if seeker, ok := in.(io.ReadSeeker); ok {
-		digest = &crypto.DigestResult{}
-		err = crypto.Digest(seeker, digest)
-		if err != nil {
-			return err
-		}
-		_, err = seeker.Seek(0, io.SeekStart)
-		if err != nil {
-			return err
-		}
-		uploadReader = seeker
-	} else {
-		var buf bytes.Buffer
-		tee := io.TeeReader(in, &buf)
-		digest = &crypto.DigestResult{}
-		err = crypto.Digest(tee, digest)
-		if err != nil {
-			return err
-		}
-		uploadReader = &buf
-	}
-
-	info, err := f.createUploadTicket(ctx, cid, name, digest)
-	if err != nil {
-		fs.Logf(f, "create upload ticket fail, err: %v", err)
-		return err
-	}
-
-	// If file already exists (status=2), skip OSS upload
-	if info.Status.String() != "2" {
-		// File doesn't exist, need to upload to OSS
-		bucket, err := ossClient.Bucket(info.Bucket)
-		if err != nil {
-			fs.Logf(f, "f.oss.Bucket fail, err: %v", err)
-			return err
-		}
-
-		err = bucket.PutObject(info.Object, uploadReader,
-			oss.ContentLength(digest.Size),
-			oss.ContentType(fs.MimeTypeFromName(name)),
-			oss.ContentMD5(digest.MD5),
-			oss.Callback(base64.StdEncoding.EncodeToString([]byte(info.Callback.Callback))),
-			oss.CallbackVar(base64.StdEncoding.EncodeToString([]byte(info.Callback.CallbackVar))),
-		)
-		if err != nil {
-			fs.Logf(f, "bucket.PutObject fail, err: %v", err)
-			return err
-		}
-	} else {
-		fs.Logf(f, "file already exists on server, skipping OSS upload")
+	if err := f.client.UploadFastOrByOSS(cidStr, name, src.Size(), uploadSeeker); err != nil {
+		return fmt.Errorf("115driver upload failed: %w", err)
 	}
 
 	f.flushDir(dir)

@@ -39,6 +39,10 @@ type UploadInitResponse struct {
 		CallbackVar string `json:"callback_var"`
 	} `json:"callback"`
 
+	// Additional signature fields for status=7
+	SignKey   string `json:"sign_key"`
+	SignCheck string `json:"sign_check"`
+
 	// Useless fields
 	FileID   int    `json:"fileid"`
 	FileInfo string `json:"fileinfo"`
