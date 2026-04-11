@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"strconv"
@@ -93,6 +94,9 @@ func Decode(input string, key Key) (output []byte, err error) {
 		return
 	}
 	data = rsaDecrypt(data)
+	if len(data) < 16 {
+		return nil, errors.New("crypto: invalid data length")
+	}
 	output = make([]byte, len(data)-16)
 	copy(output, data[16:])
 	xorTransform(output, xorDeriveKey(data[:16], 12))
