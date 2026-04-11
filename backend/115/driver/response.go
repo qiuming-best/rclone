@@ -166,7 +166,7 @@ type UploadInitResp struct {
 }
 
 type UploadOSSParams struct {
-	SHA1     string `json:"-"`
+	SHA1     string `json:"sha"`
 	Bucket   string `json:"bucket"`
 	Object   string `json:"object"`
 	Callback struct {

@@ -171,7 +171,9 @@ func (c *Pan115Client) checkUploadStatus(dirID, sha1 string) error {
 
 		fResp, err := GetFiles(req, dirID, opts...)
 		if err != nil {
-			return err
+			// Continue retrying on transient errors (network issues, rate limiting, etc.)
+			// The upload may have succeeded even if we can't see it yet
+			continue
 		}
 
 		for _, fileInfo := range fResp.Files {
