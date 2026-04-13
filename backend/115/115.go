@@ -15,6 +15,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/patrickmn/go-cache"
@@ -108,6 +109,16 @@ func init() {
 			Name:     "bind_path",
 			Help:     "Target path to bind mount the remote path to.",
 			Advanced: true,
+		}, {
+			Name:     "free_space_min_percent",
+			Default:  0,
+			Help:     "Minimum free space percentage on the local disk before stopping uploads. Set to 0 to disable. When free space drops below this threshold, rclone will refuse to receive/upload files until space is reclaimed.",
+			Advanced: false,
+		}, {
+			Name:     "temp_dir",
+			Default:  "",
+			Help:     "Temporary directory to use for spooling files that cannot be uploaded directly. Useful when local disk space is limited. If empty, uses the system default temp directory.",
+			Advanced: true,
 		}},
 	})
 }
@@ -121,11 +132,13 @@ type Options struct {
 	PacerMinSleep  fs.Duration          `config:"pacer_min_sleep"`
 	CacheExpire    fs.Duration          `config:"cache_expire"`
 	MaxConnections int                  `config:"max_connections"`
-	PageSize       int64                `config:"page_size"`
-	MountPoint     string               `config:"mount_point"`
-	BindPath       string               `config:"bind_path"`
-	WafSleep       fs.Duration          `config:"waf_sleep"`
-	Enc            encoder.MultiEncoder `config:"encoding"`
+	PageSize            int64                `config:"page_size"`
+	MountPoint          string               `config:"mount_point"`
+	BindPath            string               `config:"bind_path"`
+	WafSleep            fs.Duration          `config:"waf_sleep"`
+	Enc                 encoder.MultiEncoder `config:"encoding"`
+	FreeSpaceMinPercent int                  `config:"free_space_min_percent"`
+	TempDir             string               `config:"temp_dir"`
 }
 
 // Fs represents a remote 115 drive
@@ -968,6 +981,9 @@ func (f *Fs) getURL(ctx context.Context, remote string, pickCode string) (string
 	if err != nil {
 		return "", err
 	}
+	if !info.State {
+		return "", fmt.Errorf("api get download url failed: %s (errno: %s)", info.Msg, info.Errno)
+	}
 
 	var encodedData string
 	if err := json.Unmarshal(info.Data, &encodedData); err != nil {
@@ -1171,6 +1187,37 @@ func (o *Object) Storable() bool {
 	return true
 }
 
+// checkFreeSpace checks if the local disk has enough free space before upload.
+// Returns nil if space is sufficient or check is disabled.
+// Returns an error if free space is below the configured threshold.
+func (f *Fs) checkFreeSpace() error {
+	minPercent := f.opt.FreeSpaceMinPercent
+	if minPercent <= 0 {
+		return nil
+	}
+
+	// Get the current working directory's disk info
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(".", &stat); err != nil {
+		return fmt.Errorf("failed to get disk space info: %w", err)
+	}
+
+	// Calculate free space percentage
+	totalBlocks := stat.Blocks * uint64(stat.Bsize)
+	freeBlocks := stat.Bfree
+	if totalBlocks == 0 {
+		return fmt.Errorf("failed to calculate disk space: total blocks is zero")
+	}
+
+	freePercent := int(float64(freeBlocks) / float64(totalBlocks) * 100)
+
+	if freePercent < minPercent {
+		return fmt.Errorf("local disk space too low: %d%% free (minimum: %d%%) - refusing to upload until space is reclaimed", freePercent, minPercent)
+	}
+
+	return nil
+}
+
 // ID returns the ID of the Object if known, or "" if not
 func (o *Object) ID() string {
 	return strconv.FormatInt(o.fileID, 10)
@@ -1183,6 +1230,12 @@ func (o *Object) ID() string {
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	f := o.fs
+
+	// Check local disk space before proceeding with upload
+	if err := f.checkFreeSpace(); err != nil {
+		return err
+	}
+
 	if src.Size() == 0 {
 		fs.Debugf(src, "Skipping upload of empty file (not supported by 115)")
 		return nil
@@ -1266,7 +1319,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			}
 
 			var err error
-			tempFile, err = os.CreateTemp("", "rclone-115-upload-*")
+			tempDir := f.opt.TempDir
+			if tempDir == "" {
+				tempDir = os.TempDir()
+			}
+			tempFile, err = os.CreateTemp(tempDir, "rclone-115-upload-*")
 			if err != nil {
 				return fmt.Errorf("failed to create temp file (check disk space?): %w", err)
 			}
